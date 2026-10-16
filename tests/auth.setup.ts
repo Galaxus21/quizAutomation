@@ -22,10 +22,32 @@ setup('Authenticate live student credentials from .env', async ({ page }) => {
   await page.locator('input[name="password"], input[type="password"]').fill(password);
 
   console.log(`[Auth] 3/4 Submitting login form...`);
-  await page.getByRole('button', { name: /Log in|Sign in/i }).click();
+  const loginButton = page.getByRole('button', { name: /Log in|Sign in/i });
+  await loginButton.click();
 
-  // Assert successful transition to student portal
-  await page.waitForURL('**/student**', { timeout: 20000 });
+  // Wait for either a successful redirect or for the portal to finish handling the login request.
+  try {
+    await expect
+      .poll(
+        async () => page.url().includes('/student') || !(await loginButton.isDisabled()),
+        { timeout: 20000 }
+      )
+      .toBe(true);
+  } catch {
+    throw new Error(
+      '[Auth] Login request did not complete within 20 seconds; the portal kept the Log in button in its loading state. Check the portal/API connection and account credentials, then retry.'
+    );
+  }
+
+  if (!page.url().includes('/student')) {
+    const alerts = await page.locator('[role="alert"], [aria-live="assertive"]').allInnerTexts();
+    const errorMessage = alerts.map((message) => message.trim()).filter(Boolean).join(' ');
+    throw new Error(
+      `[Auth] Login did not redirect to the student portal${errorMessage ? `: ${errorMessage}` : '.'}`
+    );
+  }
+
+  // Assert the student session has finished loading.
   await expect(page.locator('text=Checking your session')).toHaveCount(0, { timeout: 15000 });
 
   // Extract sessionStorage entries dynamically

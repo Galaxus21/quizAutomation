@@ -36,6 +36,11 @@ export default defineConfig({
   },
   projects: [
     {
+      name: 'unit',
+      testMatch: /(?:answer-service|quiz-page)\.spec\.ts/,
+      use: { headless: true },
+    },
+    {
       name: 'setup',
       testMatch: /auth\.setup\.ts/,
     },
@@ -46,7 +51,7 @@ export default defineConfig({
         storageState: authFile,
       },
       dependencies: ['setup'],
-      testIgnore: [/auth\.setup\.ts/],
+      testIgnore: [/auth\.setup\.ts/, /(?:answer-service|quiz-page)\.spec\.ts/],
     },
   ],
 });

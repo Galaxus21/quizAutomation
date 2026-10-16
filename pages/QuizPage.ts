@@ -16,6 +16,7 @@ export class QuizPage extends BasePage {
   readonly questionButtons: Locator;
   readonly activeQuestionButton: Locator;
   readonly savingStatusBadge: Locator;
+  readonly alreadyCompletedNotice: Locator;
 
   constructor(page: Page) {
     super(page);
@@ -34,6 +35,7 @@ export class QuizPage extends BasePage {
     this.questionButtons = page.locator('button[aria-label^="Question "]');
     this.activeQuestionButton = page.locator('button[aria-current="true"]');
     this.savingStatusBadge = page.locator('[role="status"]', { hasText: 'Saving' });
+    this.alreadyCompletedNotice = page.getByText(/you have already completed this assignment/i);
   }
 
   async navigate(assignmentId: string): Promise<void> {
@@ -45,12 +47,18 @@ export class QuizPage extends BasePage {
   }
 
   /** Starts the quiz or resumes an existing IN_PROGRESS session. */
-  async beginQuiz(): Promise<void> {
+  /** Starts or resumes a quiz. Returns a terminal state when the assignment is already completed. */
+  async beginQuiz(): Promise<'started' | 'alreadyCompleted'> {
     await expect(this.loadingQuizSpinner).toHaveCount(0, { timeout: 20000 });
+
+    if (await this.alreadyCompletedNotice.isVisible()) {
+      console.log('[Quiz UI] Assignment is already completed; skipping it.');
+      return 'alreadyCompleted';
+    }
 
     if ((await this.questionButtons.count()) > 0) {
       console.log('[Quiz UI] Active IN_PROGRESS session detected! Resuming directly at questions UI.');
-      return;
+      return 'started';
     }
 
     await expect(this.startButton).toBeVisible({ timeout: 15000 });
@@ -58,12 +66,26 @@ export class QuizPage extends BasePage {
     console.log(`[Quiz UI] Clicking "${btnText}" button to start quiz attempt...`);
     await this.startButton.click();
 
+    await expect
+      .poll(
+        async () =>
+          (await this.questionButtons.count()) > 0 || (await this.alreadyCompletedNotice.isVisible()),
+        { timeout: 20000 }
+      )
+      .toBe(true);
+
+    if (await this.alreadyCompletedNotice.isVisible()) {
+      console.log('[Quiz UI] Server marked the assignment as already completed after Begin; skipping it.');
+      return 'alreadyCompleted';
+    }
+
     await expect(this.questionButtons.first()).toBeVisible({ timeout: 20000 });
     await this.page.waitForSelector(
       'p.whitespace-pre-wrap, fieldset, textarea, input[type="number"]',
       { timeout: 20000 }
     );
     console.log('[Quiz UI] Quiz session started! First question mounted on screen.');
+    return 'started';
   }
 
   async getTotalQuestionsCount(): Promise<number> {
@@ -81,6 +103,7 @@ export class QuizPage extends BasePage {
   }
 
   async waitForAnswerSaved(timeoutMs: number = 10000): Promise<void> {
+    await this.page.waitForTimeout(300);
     await expect(this.savingStatusBadge).toHaveCount(0, { timeout: timeoutMs });
   }
 
@@ -92,9 +115,10 @@ export class QuizPage extends BasePage {
 
   async clickNext(): Promise<void> {
     await expect(this.nextButton).toBeVisible({ timeout: 10000 });
+    const currentQuestionNumber = await this.getCurrentQuestionNumber();
     console.log(`  [Navigation] Clicking "Next" -> advancing to next question...`);
     await this.nextButton.click();
-    await this.page.waitForTimeout(400);
+    await expect.poll(() => this.getCurrentQuestionNumber(), { timeout: 10000 }).not.toBe(currentQuestionNumber);
   }
 
   async clickReviewAndSubmit(): Promise<void> {
@@ -145,15 +169,19 @@ export class QuizPage extends BasePage {
   /** Attends the full quiz from start through final submission. */
   async attendFullQuiz(
     answerProvider: AnswerProvider = defaultAnswerProvider
-  ): Promise<{ questionsAnswered: number; submissionConfirmed: boolean }> {
-    await this.beginQuiz();
+  ): Promise<{ questionsAnswered: number; submissionConfirmed: boolean; skippedAlreadyCompleted: boolean }> {
+    const beginResult = await this.beginQuiz();
+    if (beginResult === 'alreadyCompleted') {
+      return { questionsAnswered: 0, submissionConfirmed: false, skippedAlreadyCompleted: true };
+    }
 
     const totalQuestions = await this.getTotalQuestionsCount();
     console.log(`[Quiz UI] Total questions detected in palette: ${totalQuestions}`);
 
     let questionsAnswered = 0;
+    let reviewStarted = false;
 
-    while (true) {
+    for (let questionIndex = 0; questionIndex < totalQuestions; questionIndex++) {
       questionsAnswered++;
       const currentNum = await this.getCurrentQuestionNumber();
       console.log(`\n[Quiz UI] Attempting Question ${currentNum} of ${totalQuestions}...`);
@@ -163,26 +191,32 @@ export class QuizPage extends BasePage {
         `  [Confirmed] Q#${currentNum}/${totalQuestions} (${answer.type}) -> ${answer.details}`
       );
 
-      // Check if "Next" button is available
-      if (await this.nextButton.isVisible()) {
-        await this.clickNext();
-      } else if (await this.reviewButton.isVisible()) {
+      // The final question can expose both controls briefly; review takes priority.
+      if (await this.reviewButton.isVisible()) {
         console.log(`\n[Quiz UI] All ${totalQuestions} questions answered! Proceeding to submission...`);
         await this.clickReviewAndSubmit();
+        reviewStarted = true;
         break;
+      } else if (await this.nextButton.isVisible()) {
+        await this.clickNext();
       } else {
         // Fallback safety check if neither button is visible immediately
         await this.page.waitForTimeout(500);
         if (await this.reviewButton.isVisible()) {
           await this.clickReviewAndSubmit();
+          reviewStarted = true;
           break;
         }
         if (await this.nextButton.isVisible()) {
           await this.clickNext();
           continue;
         }
-        break;
+        throw new Error('[Quiz UI] Could not find a next or review-and-submit control after answering a question');
       }
+    }
+
+    if (!reviewStarted) {
+      throw new Error(`[Quiz UI] Reached the ${totalQuestions}-question limit without reaching submission`);
     }
 
     // Modal confirmation
@@ -190,6 +224,6 @@ export class QuizPage extends BasePage {
     await this.confirmFinalSubmission();
     await this.expectSubmissionConfirmed();
 
-    return { questionsAnswered, submissionConfirmed: true };
+    return { questionsAnswered, submissionConfirmed: true, skippedAlreadyCompleted: false };
   }
 }

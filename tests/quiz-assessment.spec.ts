@@ -31,8 +31,16 @@ test.describe('Live Quiz Assessment Runner', () => {
         await quizPage.navigate(quizId);
         const result = await quizPage.attendFullQuiz(defaultAnswerProvider);
 
-        expect(result.submissionConfirmed).toBe(true);
         attendedQuizIds.add(quizId);
+
+        if (result.skippedAlreadyCompleted) {
+          console.log(`[Runner] SKIPPED ALREADY-COMPLETED QUIZ: ${quizId}`);
+          await quizPage.returnToDashboard();
+          await dashboardPage.expectLoaded();
+          continue;
+        }
+
+        expect(result.submissionConfirmed).toBe(true);
         totalBatchesCompleted++;
 
         console.log(`\n======================================================`);

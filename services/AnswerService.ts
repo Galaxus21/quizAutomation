@@ -1,5 +1,4 @@
-import { Page } from '@playwright/test';
-import { GoogleGenAI } from '@google/genai';
+import { expect, Page } from '@playwright/test';
 
 export type QuestionType = 'MCQ_SINGLE' | 'MCQ_MULTI' | 'TRUE_FALSE' | 'SHORT_ANSWER' | 'NUMERIC';
 
@@ -177,28 +176,29 @@ export type AnswerResolver = (
   jsonSchema: Record<string, any>
 ) => Promise<TypedAnswerDecision> | TypedAnswerDecision;
 
-/** Extracts QuestionContext from DOM, resolves a typed answer via Gemini, and fills page controls. */
+interface OpenRouterChatCompletion {
+  choices?: Array<{ message?: { content?: string | Array<{ text?: string }> } }>;
+  error?: { message?: string };
+}
+
+/** Extracts QuestionContext from DOM, resolves a typed answer via OpenRouter, and fills page controls. */
 export class AnswerProvider {
   private resolver?: AnswerResolver;
-  private ai?: GoogleGenAI;
 
   constructor(resolver?: AnswerResolver) {
     this.resolver = resolver;
   }
 
-  private getAiClient(): GoogleGenAI {
-    if (!this.ai) {
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey) {
-        throw new Error('[AnswerProvider] GEMINI_API_KEY is not set in .env');
-      }
-      this.ai = new GoogleGenAI({ apiKey });
+  private getApiKey(): string {
+    const apiKey = process.env.OPENROUTER_API_KEY?.trim();
+    if (!apiKey || apiKey === 'your_openrouter_api_key_here') {
+      throw new Error('[AnswerProvider] OPENROUTER_API_KEY is not set in .env');
     }
-    return this.ai;
+    return apiKey;
   }
 
   async extractQuestionContext(page: Page): Promise<QuestionContext> {
-    await page.waitForSelector('p.text-lg, p.sm\\:text-xl, fieldset, textarea, input[type="number"]', {
+    await page.waitForSelector('p.text-lg, p.sm\\:text-xl, p.whitespace-pre-wrap, fieldset, textarea, input[type="number"]', {
       timeout: 15000,
     });
 
@@ -211,7 +211,7 @@ export class AnswerProvider {
     }
 
     // 2. Prompt Text
-    const promptLocator = page.locator('p.text-lg, p.sm\\:text-xl').first();
+    const promptLocator = page.locator('p.text-lg, p.sm\\:text-xl, p.whitespace-pre-wrap').first();
     const prompt = (await promptLocator.count()) > 0 ? (await promptLocator.innerText()).trim() : '';
 
     // 3. Marks Badge
@@ -291,12 +291,76 @@ export class AnswerProvider {
     }
 
     // 7. Numeric Input
-    return {
-      questionNumber,
-      type: 'NUMERIC',
-      prompt,
-      marks,
-    };
+    const numberInput = page.locator('input[type="number"]');
+    if ((await numberInput.count()) > 0 && (await numberInput.first().isVisible())) {
+      return {
+        questionNumber,
+        type: 'NUMERIC',
+        prompt,
+        marks,
+      };
+    }
+
+    throw new Error('[AnswerProvider] Could not determine the current question input type');
+  }
+
+  private parseDecision(context: QuestionContext, content: string): TypedAnswerDecision {
+    const parsed: unknown = JSON.parse(content);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('OpenRouter returned an answer that is not a JSON object');
+    }
+
+    const decision = parsed as Record<string, unknown>;
+    if (decision.type !== context.type) {
+      throw new Error(`OpenRouter returned type "${String(decision.type)}" for ${context.type}`);
+    }
+    if ('options' in context && context.options.length === 0) {
+      throw new Error('The question has no selectable options');
+    }
+
+    const isValidOptionIndex = (value: unknown): value is number =>
+      Number.isInteger(value) &&
+      typeof value === 'number' &&
+      value >= 0 &&
+      'options' in context &&
+      value < context.options.length;
+
+    switch (context.type) {
+      case 'MCQ_SINGLE':
+        if (!isValidOptionIndex(decision.selectedOptionIndex)) {
+          throw new Error('OpenRouter returned an invalid selectedOptionIndex');
+        }
+        return { type: 'MCQ_SINGLE', selectedOptionIndex: decision.selectedOptionIndex };
+      case 'TRUE_FALSE':
+        if (
+          !isValidOptionIndex(decision.selectedOptionIndex) ||
+          (decision.selectedOptionIndex !== 0 && decision.selectedOptionIndex !== 1)
+        ) {
+          throw new Error('OpenRouter returned an invalid selectedOptionIndex');
+        }
+        return { type: 'TRUE_FALSE', selectedOptionIndex: decision.selectedOptionIndex };
+      case 'MCQ_MULTI': {
+        if (!Array.isArray(decision.selectedOptionIndices) || decision.selectedOptionIndices.length === 0) {
+          throw new Error('OpenRouter returned no selectedOptionIndices');
+        }
+        const uniqueIndices = [...new Set(decision.selectedOptionIndices)];
+        const indices = uniqueIndices.filter(isValidOptionIndex);
+        if (indices.length !== uniqueIndices.length) {
+          throw new Error('OpenRouter returned an invalid selectedOptionIndices value');
+        }
+        return { type: 'MCQ_MULTI', selectedOptionIndices: indices.sort((a, b) => a - b) };
+      }
+      case 'SHORT_ANSWER':
+        if (typeof decision.textAnswer !== 'string' || !decision.textAnswer.trim()) {
+          throw new Error('OpenRouter returned an empty textAnswer');
+        }
+        return { type: 'SHORT_ANSWER', textAnswer: decision.textAnswer.trim() };
+      case 'NUMERIC':
+        if (typeof decision.numericAnswer !== 'number' || !Number.isFinite(decision.numericAnswer)) {
+          throw new Error('OpenRouter returned an invalid numericAnswer');
+        }
+        return { type: 'NUMERIC', numericAnswer: decision.numericAnswer };
+    }
   }
 
   /**
@@ -310,8 +374,9 @@ export class AnswerProvider {
       return await this.resolver(context, schema);
     }
 
-    const ai = this.getAiClient();
-    const model = process.env.GEMINI_MODEL ?? 'gemini-3.8-flash';
+    const apiKey = this.getApiKey();
+    const model = process.env.OPENROUTER_MODEL?.trim() || 'openrouter/free';
+    const endpoint = process.env.OPENROUTER_BASE_URL?.trim() || 'https://openrouter.ai/api/v1/chat/completions';
     const maxAttempts = 3;
 
     const typeInstructions: Record<QuestionContext['type'], string> = {
@@ -351,26 +416,49 @@ export class AnswerProvider {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        console.log(`  [AnswerProvider] Querying model "${model}" for Q#${context.questionNumber} (attempt ${attempt}/${maxAttempts})...`);
-        const interaction = await ai.interactions.create({
-          model,
-          input: userPrompt,
-          system_instruction: systemInstruction,
-          store: false,
-          response_format: {
-            type: 'text',
-            mime_type: 'application/json',
-            schema,
+        console.log(`  [AnswerProvider] Querying OpenRouter model "${model}" for Q#${context.questionNumber} (attempt ${attempt}/${maxAttempts})...`);
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+            'X-Title': 'Quiz Portal Automation',
           },
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: 'system', content: systemInstruction },
+              { role: 'user', content: userPrompt },
+            ],
+            temperature: 0.1,
+            max_tokens: 400,
+            response_format: {
+              type: 'json_schema',
+              json_schema: {
+                name: 'quiz_answer',
+                strict: true,
+                schema,
+              },
+            },
+          }),
         });
-
-        const text = interaction.output_text;
-        if (!text) {
-          throw new Error('Gemini returned no content');
+        const responseBody = (await response.json().catch(() => ({}))) as OpenRouterChatCompletion;
+        if (!response.ok) {
+          throw Object.assign(
+            new Error(responseBody.error?.message || `OpenRouter request failed with status ${response.status}`),
+            { status: response.status }
+          );
         }
 
-        const parsed = JSON.parse(text);
-        const decision = { type: context.type, ...parsed } as TypedAnswerDecision;
+        const content = responseBody.choices?.[0]?.message?.content;
+        const text = Array.isArray(content)
+          ? content.map((part) => part.text ?? '').join('')
+          : content;
+        if (!text) {
+          throw new Error('OpenRouter returned no content');
+        }
+
+        const decision = this.parseDecision(context, text);
         console.log(`  [AnswerProvider] Decision received: ${JSON.stringify(decision)}`);
         return decision;
       } catch (err) {
@@ -382,19 +470,22 @@ export class AnswerProvider {
         );
 
         const status = (err as { status?: number }).status;
-        const retryable = status === undefined || status === 429 || status >= 500;
+        const isInvalidModelResponse =
+          err instanceof SyntaxError ||
+          (err instanceof Error && err.message.startsWith('OpenRouter returned'));
+        const retryable = !isInvalidModelResponse && (status === undefined || status === 408 || status === 429 || status >= 500);
         if (!retryable) break;
 
         if (attempt < maxAttempts) {
           const delayMs = 1000 * 2 ** (attempt - 1);
           console.log(`  [AnswerProvider] Retrying in ${delayMs / 1000}s...`);
-          await new Promise((r) => setTimeout(r, delayMs));
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
         }
       }
     }
 
     throw new Error(
-      `Failed to resolve answer via Gemini: ${
+      `Failed to resolve answer via OpenRouter: ${
         lastError instanceof Error ? lastError.message : String(lastError)
       }`
     );
@@ -436,6 +527,7 @@ export class AnswerProvider {
       if ((await radioInput.count()) > 0 && !(await radioInput.isChecked())) {
         await radioInput.check({ force: true });
       }
+      await expect(radioInput).toBeChecked();
 
       const chosenOpt = context.options[targetIndex];
       const details = `Selected Option [${targetIndex}] (${chosenOpt?.letter}): "${chosenOpt?.text}"`;
@@ -477,6 +569,7 @@ export class AnswerProvider {
         }
 
         if (shouldBeChecked) {
+          await expect(cbInput).toBeChecked();
           const opt = context.options[idx];
           pickedSummary.push(`[${idx}] (${opt.letter}) "${opt.text}"`);
         }
